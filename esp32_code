@@ -1,0 +1,266 @@
+#include <Arduino.h>
+#include "DHT.h"
+#include <TinyGPS++.h>
+#include <HardwareSerial.h>
+
+// ======================= Cấu hình phần cứng =======================
+const int PIN_HALL = 27;     // DO của FC-33 nối vào đây
+const float PULSES_PER_REV = 1.0;        
+const float WHEEL_CIRCUMFERENCE_M = 0.094248; 
+const uint32_t GATE_TIME_MS = 500;
+const uint32_t DEBOUNCE_US  = 1500;
+
+// Biến dùng trong ngắt
+volatile uint32_t pulseCount = 0;
+volatile uint32_t lastRiseUs = 0;
+volatile uint32_t lastPeriodUs = 0;
+
+// ======================= Pin Config =====================
+#define LED_PIN        2
+#define DHTPIN         4
+#define DHTTYPE        DHT11
+#define MQ135_PIN      34
+#define TRIG_PIN       5
+#define ECHO_PIN       18
+
+// ⚡ Xi nhan
+#define LEFT_SIGNAL_PIN   19
+#define RIGHT_SIGNAL_PIN  21
+
+#define BUZZER 25
+
+// ======================= GPS ============================
+TinyGPSPlus gps;
+HardwareSerial GPS_Serial(2); // RX=16, TX=17
+
+// ======================= DHT ============================
+DHT dht(DHTPIN, DHTTYPE);
+
+// ======================= Dữ liệu toàn cục ============================
+volatile float dhtTemperature = 0.0;
+volatile float dhtHumidity = 0.0;
+
+volatile double gpsLatitude = 0.0;
+volatile double gpsLongitude = 0.0;
+volatile double gpsSpeedKmph = 0.0;
+volatile int gpsSatellites = 0;
+
+volatile int mq135_raw = 0;
+volatile float mq135_v = 0.0;
+volatile float distanceCm = 0.0;
+volatile float wheelSpeedKmh = 0.0;
+
+const float ADC_RESOLUTION = 4095.0;
+const float VOLTAGE_REF = 3.3;
+
+// 🟡 Trạng thái xi nhan
+bool turnLeftOn = false;
+bool turnRightOn = false;
+
+// ======================= Ngắt Hall =======================
+void IRAM_ATTR hallISR() {
+  uint32_t nowUs = micros();
+  if (nowUs - lastRiseUs < DEBOUNCE_US) return;
+  if (lastRiseUs != 0) {
+    lastPeriodUs = nowUs - lastRiseUs;
+  }
+  lastRiseUs = nowUs;
+  pulseCount++;
+}
+
+// ======================= Task 1: DHT11 ===================
+void Task_ReadDHT(void *pvParameters) {
+  dht.begin();
+  Serial.println("Task DHT started");
+  while (true) {
+    float h = dht.readHumidity();
+    float t = dht.readTemperature();
+    if (!isnan(h) && !isnan(t)) {
+      dhtHumidity = h;
+      dhtTemperature = t;
+    }
+    vTaskDelay(pdMS_TO_TICKS(2000));
+  }
+}
+
+// ======================= Task 2: MQ135 ===================
+void Task_ReadMQ135(void *pvParameters) {
+  pinMode(PIN_HALL, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_HALL), hallISR, FALLING);
+
+  analogReadResolution(12);
+  while (true) {
+    mq135_raw = analogRead(MQ135_PIN);
+    mq135_v = (float)mq135_raw / ADC_RESOLUTION * VOLTAGE_REF;
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+
+// ======================= Task 3: GPS =====================
+void Task_ReadGPS(void *pvParameters) {
+  GPS_Serial.begin(9600, SERIAL_8N1, 16, 17);
+  Serial.println("Task GPS started");
+  while (true) {
+    while (GPS_Serial.available() > 0) {
+      gps.encode(GPS_Serial.read());
+    }
+    if (gps.location.isUpdated()) {
+      gpsLatitude = gps.location.lat();
+      gpsLongitude = gps.location.lng();
+      gpsSpeedKmph = gps.speed.kmph();
+      gpsSatellites = gps.satellites.value();
+    }
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+
+// ======================= Task 4: HC-SR04 =====================
+float readDistance() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+  return duration * 0.0343 / 2;
+}
+
+void Task_ReadSR04(void *pvParameters) {
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  Serial.println("Task SR04 started");
+  while (true) {
+    distanceCm = readDistance();
+    if (distanceCm <= 10 && distanceCm > 0) {   // Chỉ kêu khi khoảng cách nhỏ hơn hoặc bằng 10 cm
+      digitalWrite(BUZZER, HIGH);
+    } else {
+      digitalWrite(BUZZER, LOW);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+  }
+}
+
+// ======================= Task 5: Gửi Serial JSON =====================
+void Task_SendToPC(void *pvParameters) {
+  Serial.println("Task JSON Sender started");
+  while (true) {
+    unsigned long now = millis();
+    Serial.print("{");
+    Serial.print("\"ts\":"); Serial.print(now); Serial.print(",");
+    Serial.print("\"spd_kmh\":"); Serial.print(wheelSpeedKmh, 2); Serial.print(",");
+    Serial.print("\"gps_spd_kmh\":"); Serial.print(wheelSpeedKmh, 2); Serial.print(",");
+    Serial.print("\"lat\":"); Serial.print(gpsLatitude, 6); Serial.print(",");
+    Serial.print("\"lon\":"); Serial.print(gpsLongitude, 6); Serial.print(",");
+    Serial.print("\"alt\":"); Serial.print("null"); Serial.print(",");
+    Serial.print("\"sats\":"); Serial.print(gpsSatellites); Serial.print(",");
+    Serial.print("\"temp_c\":"); Serial.print(dhtTemperature, 2); Serial.print(",");
+    Serial.print("\"hum_pct\":"); Serial.print(dhtHumidity, 2); Serial.print(",");
+    Serial.print("\"mq135_raw\":"); Serial.print(mq135_raw); Serial.print(",");
+    Serial.print("\"mq135_v\":"); Serial.print(mq135_v, 3); Serial.print(",");
+    Serial.print("\"mq135_ppm\":"); Serial.print("null"); Serial.print(",");
+    Serial.print("\"dist_cm\":"); Serial.print(distanceCm, 1);
+    Serial.println("}");
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+// ======================= SETUP ===========================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(LEFT_SIGNAL_PIN, OUTPUT);
+  pinMode(RIGHT_SIGNAL_PIN, OUTPUT);
+  digitalWrite(LEFT_SIGNAL_PIN, LOW);
+  digitalWrite(RIGHT_SIGNAL_PIN, LOW);
+  pinMode(BUZZER, OUTPUT);
+  digitalWrite(BUZZER, LOW);
+  
+
+  xTaskCreatePinnedToCore(Task_ReadDHT, "ReadDHT", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(Task_ReadMQ135, "ReadMQ135", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(Task_ReadGPS, "ReadGPS", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(Task_ReadSR04, "ReadSR04", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(Task_SendToPC, "SendPC", 4096, NULL, 1, NULL, 1);
+}
+
+// ======================= LOOP ===========================
+void loop() {
+  // 🟡 Nhận lệnh từ Dashboard
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+
+    if (cmd == "TURN_LEFT") {
+      turnLeftOn = !turnLeftOn; // đảo trạng thái
+      turnRightOn = false;      // nếu bật trái thì tắt phải
+    } 
+    else if (cmd == "TURN_RIGHT") {
+      turnRightOn = !turnRightOn;
+      turnLeftOn = false;
+    }
+  }
+
+  // ⚡ Cập nhật GPIO xi nhan
+  //digitalWrite(LEFT_SIGNAL_PIN, turnLeftOn ? HIGH : LOW);
+  //digitalWrite(RIGHT_SIGNAL_PIN, turnRightOn ? HIGH : LOW);
+static unsigned long lastBlink = 0;
+static bool blinkState = false;
+unsigned long blinkNow = millis();
+
+if (blinkNow - lastBlink >= 500) {
+  blinkState = !blinkState;
+  lastBlink = blinkNow;
+}
+
+if (turnLeftOn) {
+  digitalWrite(LEFT_SIGNAL_PIN, blinkState ? HIGH : LOW);
+} else {
+  digitalWrite(LEFT_SIGNAL_PIN, LOW);
+}
+
+if (turnRightOn) {
+  digitalWrite(RIGHT_SIGNAL_PIN, blinkState ? HIGH : LOW);
+} else {
+  digitalWrite(RIGHT_SIGNAL_PIN, LOW);
+}
+ 
+  // ⚙️ Đo tốc độ Hall sensor
+  static uint32_t t0 = millis();
+  uint32_t now = millis();
+
+  if (now - t0 >= GATE_TIME_MS) {
+    noInterrupts();
+    uint32_t count = pulseCount;
+    pulseCount = 0;
+    uint32_t periodUs = lastPeriodUs;
+    uint32_t lastUs   = lastRiseUs;
+    interrupts();
+
+    float gateSec = (now - t0) / 1000.0f;
+    t0 = now;
+
+    float revs = count / PULSES_PER_REV;
+    float rps  = (gateSec > 0) ? (revs / gateSec) : 0.0;
+    float speed_mps = rps * WHEEL_CIRCUMFERENCE_M;
+    float speed_kmh_gate = speed_mps * 3.6f;
+
+    float speed_kmh_period = 0.0f;
+    bool stale = true;
+    if ((micros() - lastUs) < (uint32_t)(3 * GATE_TIME_MS) * 1000UL && periodUs > 0) {
+      stale = false;
+      float periodSec = periodUs / 1e6f;
+      float rps2 = (1.0f / periodSec) / PULSES_PER_REV;
+      speed_kmh_period = rps2 * WHEEL_CIRCUMFERENCE_M * 3.6f;
+    }
+
+    float speed_kmh = speed_kmh_gate;
+    if (!stale && speed_kmh_gate < 2.0f) {
+      speed_kmh = speed_kmh_period;
+    }
+
+    wheelSpeedKmh = speed_kmh;
+  }
+}
