@@ -2,7 +2,7 @@
 
 A IoT dashboard that monitors **vehicle speed, GPS position, environmental data, and gas levels**, built with **ESP32** and a **Python Tkinter GUI** interface.
 
-![Dashboard Preview](screenshot.png)
+![Dashboard Preview](SmartDashboard-creens.png)
 *(Example GUI built with Tkinter — showing live data updates from ESP32)*
 
 ---
